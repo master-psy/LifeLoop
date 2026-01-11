@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LifeLoop | 周期事务管理</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Vue 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <!-- FontAwesome -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- Firebase SDK (Compat version for easier in-browser usage) -->
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-auth-compat.js"></script>
+
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        dark: { bg: '#0f172a', card: '#1e293b', accent: '#3b82f6' }
+                    },
+                    animation: {
+                        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                    }
+                }
+            }
+        }
+    </script>
+
+    <style>
+        body { background-color: #0f172a; color: #e2e8f0; font-family: 'Segoe UI', Roboto, sans-serif; }
+        .list-enter-active, .list-leave-active { transition: all 0.4s ease; }
+        .list-enter-from, .list-leave-to { opacity: 0; transform: translateY(20px); }
+        .progress-bar { transition: width 1s ease-in-out; }
+        .modal-backdrop { backdrop-filter: blur(5px); }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #0f172a; }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #475569; }
+        
+        /* 玻璃拟态卡片增强 */
+        .glass-panel {
+            background: rgba(30, 41, 59, 0.7);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+    </style>
+</head>
+<body>
+
+<div id="app" class="min-h-screen flex flex-col max-w-7xl mx-auto px-4 py-6">
+    
+    <!-- 头部区域 -->
+    <header class="flex justify-between items-center mb-6">
+        <div class="flex items-center gap-3">
+            <h1 class="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-purple-500">
+                <i class="fa-solid fa-infinity mr-2 text-blue-400"></i>LifeLoop
+            </h1>
+            <!-- 数据源指示器 -->
+            <span class="text-xs px-2 py-0.5 rounded border" 
+                  :class="useFirebase ? 'border-green-500/30 text-green-400 bg-green-500/10' : 'border-slate-500/30 text-slate-400 bg-slate-500/10'">
+                <i class="fa-solid" :class="useFirebase ? 'fa-cloud' : 'fa-hard-drive'"></i>
+                {{ useFirebase ? '云端同步' : '本地存储' }}
+            </span>
+        </div>
+        <div class="flex gap-3">
+            <button @click="showSettings = true" class="p-3 rounded-full bg-slate-800 hover:bg-slate-700 transition text-slate-300 relative group" title="设置">
+                <i class="fa-solid fa-gear"></i>
+                <span v-if="!firebaseConfigured && useFirebase" class="absolute top-0 right-0 w-3 h-3 bg-red-500 rounded-full animate-pulse"></span>
+            </button>
+            <button @click="openAddModal" class="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-full font-medium transition shadow-lg shadow-blue-500/30 flex items-center">
+                <i class="fa-solid fa-plus mr-2"></i> 新建事项
+            </button>
+        </div>
+    </header>
+
+    <!-- 概览统计 (缩小版) -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+        <div class="glass-panel p-3 rounded-xl flex items-center justify-between">
+            <div class="text-slate-400 text-xs uppercase">总事项</div>
+            <div class="text-xl font-bold text-white">{{ tasks.length }}</div>
+        </div>
+        <div class="glass-panel p-3 rounded-xl flex items-center justify-between relative overflow-hidden">
+            <div class="text-slate-400 text-xs uppercase">急需处理</div>
+            <div class="text-xl font-bold text-red-400">{{ urgentCount }}</div>
+            <div v-if="urgentCount > 0" class="absolute right-2 top-2 w-2 h-2 rounded-full bg-red-500 animate-ping"></div>
+        </div>
+        <div class="glass-panel p-3 rounded-xl flex items-center justify-between">
+            <div class="text-slate-400 text-xs uppercase">待办 (今天/超期)</div>
+            <div class="text-xl font-bold text-orange-400">{{ todayTasks.length }}</div>
+        </div>
+        <button @click="triggerManualPush" :disabled="!webhookUrl" class="glass-panel p-3 rounded-xl text-left hover:bg-slate-700/50 transition disabled:opacity-50 flex items-center justify-between">
+            <div class="text-slate-400 text-xs uppercase"><i class="fa-regular fa-paper-plane mr-1"></i> 推送报告</div>
+            <i class="fa-solid fa-chevron-right text-xs text-slate-500"></i>
+        </button>
+    </div>
+
+    <!-- 主布局：双栏设计 -->
+    <div class="flex flex-col lg:flex-row gap-6 flex-1 items-start">
+        
+        <!-- 左侧栏：今天需处理 (Focus View) -->
+        <div class="w-full lg:w-1/3 xl:w-1/4 space-y-4">
+            <div class="flex items-center gap-2 mb-2">
+                <div class="w-1 h-6 bg-orange-500 rounded-full"></div>
+                <h2 class="text-xl font-bold text-white">今天需处理</h2>
+                <span class="text-xs bg-slate-700 text-slate-300 px-2 py-0.5 rounded-full">{{ todayTasks.length }}</span>
+            </div>
+
+            <div v-if="todayTasks.length === 0" class="glass-panel p-6 rounded-xl text-center border-dashed border-2 border-slate-700">
+                <i class="fa-solid fa-mug-hot text-4xl text-slate-600 mb-3"></i>
+                <p class="text-slate-400 text-sm">今日无紧急事项<br>享受生活吧！</p>
+            </div>
+
+            <transition-group name="list" tag="div" class="space-y-3">
+                <div v-for="task in todayTasks" :key="task.id" 
+                     class="glass-panel p-4 rounded-xl border-l-4 relative group hover:bg-slate-800 transition"
+                     :class="calculateDaysLeft(task) < 0 ? 'border-l-red-500' : 'border-l-orange-400'">
+                    
+                    <div class="flex justify-between items-start">
+                        <div>
+                            <h3 class="font-bold text-white">{{ task.title }}</h3>
+                            <p class="text-xs text-red-300 font-mono mt-1">
+                                <i class="fa-regular fa-clock mr-1"></i>
+                                {{ getDaysLeftText(task) }}
+                            </p>
+                        </div>
+                        <button @click="checkIn(task)" class="w-8 h-8 rounded-full bg-slate-700 hover:bg-green-600 text-slate-300 hover:text-white transition flex items-center justify-center shadow-lg" title="完成打卡">
+                            <i class="fa-solid fa-check"></i>
+                        </button>
+                    </div>
+                    <!-- 快捷操作栏 (Hover显示) -->
+                    <div class="absolute right-2 bottom-2 opacity-0 group-hover:opacity-100 transition text-xs flex gap-2">
+                        <button @click="editTask(task)" class="text-slate-400 hover:text-blue-400">编辑</button>
+                    </div>
+                </div>
+            </transition-group>
+        </div>
+
+        <!-- 右侧栏：所有周期 (Grid View) -->
+        <div class="flex-1 w-full">
+            <div class="flex items-center gap-2 mb-6">
+                <div class="w-1 h-6 bg-blue-500 rounded-full"></div>
+                <h2 class="text-xl font-bold text-white">所有循环周期</h2>
+            </div>
+
+            <div v-if="tasks.length === 0" class="text-center py-20 text-slate-500">
+                <i class="fa-solid fa-box-open text-6xl mb-4 opacity-30"></i>
+                <p>暂无数据，点击右上角添加</p>
+            </div>
+
+            <transition-group name="list" tag="div" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                <div v-for="task in otherTasks" :key="task.id" 
+                     class="glass-panel rounded-xl p-5 hover:shadow-lg hover:shadow-blue-500/10 transition group relative overflow-hidden flex flex-col justify-between h-full">
+                    
+                    <div>
+                        <div class="flex justify-between items-start mb-3">
+                            <div>
+                                <h3 class="font-bold text-lg text-white group-hover:text-blue-400 transition truncate pr-2">{{ task.title }}</h3>
+                                <p class="text-xs text-slate-400 flex items-center mt-1">
+                                    <i class="fa-solid fa-arrows-rotate mr-1.5 text-slate-500"></i> {{ task.cycleDays }}天循环
+                                </p>
+                            </div>
+                            <div class="px-2 py-1 rounded text-xs font-bold whitespace-nowrap" :class="getStatusBadge(task).class">
+                                {{ getStatusBadge(task).text }}
+                            </div>
+                        </div>
+
+                        <div class="mb-4">
+                            <div class="flex justify-between text-xs text-slate-500 mb-1">
+                                <span>进度</span>
+                                <span>{{ getProgressPercent(task).toFixed(0) }}%</span>
+                            </div>
+                            <div class="h-1.5 bg-slate-700 rounded-full overflow-hidden w-full">
+                                <div class="h-full rounded-full transition-all duration-1000" 
+                                     :class="getProgressColor(task)"
+                                     :style="{ width: getProgressPercent(task) + '%' }"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 底部信息 -->
+                    <div class="flex justify-between items-end mt-2 pt-3 border-t border-slate-700/50">
+                        <div>
+                            <div class="text-xs text-slate-500">下次预计</div>
+                            <div class="text-sm font-medium text-slate-300">
+                                {{ getNextDate(task) }}
+                                <!-- 新增：显示具体剩余天数 -->
+                                <span class="text-xs ml-1" :class="calculateDaysLeft(task) < 0 ? 'text-red-400' : 'text-slate-400'">
+                                    ({{ getDaysLeftText(task) }})
+                                </span>
+                            </div>
+                        </div>
+                        <div class="flex gap-2">
+                            <button @click="editTask(task)" class="p-2 rounded bg-slate-700/50 hover:bg-slate-600 text-slate-300 transition">
+                                <i class="fa-solid fa-pen text-xs"></i>
+                            </button>
+                            <!-- 如果不在左侧显示，则在这里显示打卡按钮 -->
+                            <button v-if="calculateDaysLeft(task) > 1" @click="checkIn(task)" class="px-3 py-1.5 rounded bg-slate-700 hover:bg-blue-600 text-white text-xs transition">
+                                打卡
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </transition-group>
+        </div>
+    </div>
+
+    <!-- 通用模态框 -->
+    <div v-if="showModal || showSettings" class="fixed inset-0 z-50 flex items-center justify-center modal-backdrop bg-black/60 p-4">
+        
+        <!-- 编辑/新建 弹窗 -->
+        <div v-if="showModal" class="bg-slate-800 rounded-2xl shadow-2xl w-full max-w-md border border-slate-700 animate-[fadeIn_0.3s_ease-out]">
+            <div class="p-6 border-b border-slate-700 flex justify-between items-center">
+                <h2 class="text-xl font-bold text-white">{{ isEditing ? '编辑事项' : '新建循环' }}</h2>
+                <button @click="closeModal" class="text-slate-400 hover:text-white"><i class="fa-solid fa-times"></i></button>
+            </div>
+            <div class="p-6 space-y-4">
+                <div>
+                    <label class="block text-sm font-medium text-slate-400 mb-1">名称</label>
+                    <input v-model="form.title" type="text" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-white focus:border-blue-500 focus:outline-none">
+                </div>
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-slate-400 mb-1">周期 (天)</label>
+                        <input v-model.number="form.cycleDays" type="number" min="1" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-white focus:border-blue-500 focus:outline-none">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-slate-400 mb-1">上次完成</label>
+                        <input v-model="form.lastDate" type="date" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-white focus:border-blue-500 focus:outline-none">
+                    </div>
+                </div>
+            </div>
+            <div class="p-6 pt-0 flex justify-between">
+                <button v-if="isEditing" @click="deleteTask" class="text-red-400 hover:text-red-300 text-sm"><i class="fa-solid fa-trash mr-1"></i> 删除</button>
+                <div v-else></div>
+                <div class="flex gap-3">
+                    <button @click="closeModal" class="px-4 py-2 rounded-lg text-slate-300 hover:bg-slate-700">取消</button>
+                    <button @click="saveTask" class="px-6 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-500/20">保存</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 设置 弹窗 -->
+        <div v-if="showSettings" class="bg-slate-800 rounded-2xl shadow-2xl w-full max-w-lg border border-slate-700 flex flex-col max-h-[90vh]">
+            <div class="p-6 border-b border-slate-700">
+                <div class="flex gap-4 border-b border-slate-700 pb-2 mb-4">
+                    <button @click="settingsTab = 'push'" :class="settingsTab === 'push' ? 'text-blue-400 border-b-2 border-blue-400' : 'text-slate-400'" class="pb-2 px-2 transition">推送通知</button>
+                    <button @click="settingsTab = 'db'" :class="settingsTab === 'db' ? 'text-green-400 border-b-2 border-green-400' : 'text-slate-400'" class="pb-2 px-2 transition">数据库 (Firebase)</button>
+                </div>
+                <h2 class="text-xl font-bold text-white flex items-center">
+                    {{ settingsTab === 'push' ? '微信推送设置' : '云端数据库配置' }}
+                </h2>
+            </div>
+            
+            <div class="p-6 overflow-y-auto custom-scrollbar">
+                <!-- 推送设置 -->
+                <div v-if="settingsTab === 'push'">
+                    <p class="text-sm text-slate-400 mb-4">使用 PushPlus 等 Webhook 服务。</p>
+                    <label class="block text-sm font-medium text-slate-400 mb-1">Webhook URL</label>
+                    <input v-model="tempWebhookUrl" type="text" placeholder="https://..." class="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2 text-xs text-white mb-4">
+                    <div class="flex items-center gap-2">
+                        <input type="checkbox" id="autoPush" v-model="settingsAutoPush" class="rounded bg-slate-900 border-slate-700">
+                        <label for="autoPush" class="text-sm text-slate-300">每日首次打开时自动推送过期事项</label>
+                    </div>
+                </div>
+
+                <!-- 数据库设置 -->
+                <div v-if="settingsTab === 'db'">
+                    <div class="flex items-center justify-between mb-4 bg-slate-900 p-3 rounded-lg border border-slate-700">
+                        <span class="text-sm text-slate-300">启用 Firebase 云端同步</span>
+                        <div @click="toggleFirebase" class="w-12 h-6 rounded-full p-1 cursor-pointer transition duration-300 ease-in-out" :class="useFirebase ? 'bg-green-600' : 'bg-slate-600'">
+                            <div class="w-4 h-4 bg-white rounded-full shadow-md transform transition duration-300 ease-in-out" :class="useFirebase ? 'translate-x-6' : 'translate-x-0'"></div>
+                        </div>
+                    </div>
+                    
+                    <div v-if="useFirebase" class="space-y-4 animate-[fadeIn_0.3s]">
+                        <div class="text-xs text-amber-400 bg-amber-900/30 p-3 rounded border border-amber-900/50">
+                            <i class="fa-solid fa-triangle-exclamation mr-1"></i>
+                            请确保 Firebase 控制台已开启 <b>Firestore</b> 和 <b>Authentication (匿名登录)</b>。
+                        </div>
+                        <div>
+                            <label class="block text-sm font-medium text-slate-400 mb-1">Firebase Config (JSON)</label>
+                            <textarea v-model="firebaseConfigStr" rows="6" placeholder='{"apiKey": "AIza...", "authDomain": "...", "projectId": "..."}' class="w-full bg-slate-900 border border-slate-700 rounded-lg p-3 text-xs font-mono text-slate-300 focus:border-green-500 focus:outline-none"></textarea>
+                            <p class="text-xs text-slate-500 mt-1">从 Firebase 控制台 -> 项目设置 -> 常规 -> 你的应用 -> SDK 设置与配置 中复制。</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="p-6 pt-0 flex justify-end gap-3 mt-auto">
+                <button @click="showSettings = false" class="px-4 py-2 rounded-lg text-slate-300 hover:bg-slate-700">关闭</button>
+                <button @click="saveSettings" class="px-6 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-medium">保存配置</button>
+            </div>
+        </div>
+    </div>
+
+</div>
+
+<script>
+    const { createApp, ref, computed, onMounted, watch } = Vue;
+
+    createApp({
+        setup() {
+            // --- State ---
+            const tasks = ref([]);
+            const showModal = ref(false);
+            const showSettings = ref(false);
+            const settingsTab = ref('push'); // 'push' or 'db'
+            const isEditing = ref(false);
+            const editingId = ref(null);
+            
+            const form = ref({ title: '', cycleDays: 7, lastDate: new Date().toISOString().split('T')[0] });
+            
+            // Push Settings
+            const webhookUrl = ref('');
+            const tempWebhookUrl = ref('');
+            const settingsAutoPush = ref(false);
+
+            // Firebase Settings
+            const useFirebase = ref(false);
+            const firebaseConfigStr = ref('');
+            const firebaseConfigured = ref(false);
+            let db = null;
+            let unsubscribeSnapshot = null;
+
+            // --- Computed ---
+            const sortedTasks = computed(() => {
+                return [...tasks.value].sort((a, b) => calculateDaysLeft(a) - calculateDaysLeft(b));
+            });
+
+            // "今天需处理"：已过期(<= -1) 或 今天(0) 或 明天(1)
+            const todayTasks = computed(() => {
+                return sortedTasks.value.filter(t => calculateDaysLeft(t) <= 1);
+            });
+
+            // "其他"：未来需要处理的
+            const otherTasks = computed(() => {
+                return sortedTasks.value; // 显示所有在网格中，或者可以 filter(t => calculateDaysLeft(t) > 1) 互斥显示
+                // 为了视觉完整性，这里我们在右侧也显示所有，或者只显示非紧急的。
+                // 用户需求是"加上一列"，通常意味着左侧是Focus，右侧是Overview。
+                // 也可以做成互斥： return sortedTasks.value.filter(t => calculateDaysLeft(t) > 1);
+                // 让我们保持右侧显示所有，但可能用不同样式区分？或者互斥更好看。
+                // 决定：互斥显示，这样不会重复。左侧是 Inbox/Today，右侧是 Future.
+                return sortedTasks.value.filter(t => calculateDaysLeft(t) > 1);
+            });
+
+            const urgentCount = computed(() => tasks.value.filter(t => calculateDaysLeft(t) <= 0).length);
+
+            // --- Lifecycle ---
+            onMounted(async () => {
+                // Load Settings
+                const savedUrl = localStorage.getItem('lifeloop_webhook');
+                if (savedUrl) { webhookUrl.value = savedUrl; tempWebhookUrl.value = savedUrl; }
+                const savedAuto = localStorage.getItem('lifeloop_autopush');
+                if (savedAuto) settingsAutoPush.value = JSON.parse(savedAuto);
+                
+                const savedUseFirebase = localStorage.getItem('lifeloop_use_firebase');
+                if (savedUseFirebase) useFirebase.value = JSON.parse(savedUseFirebase);
+
+                const savedFbConfig = localStorage.getItem('lifeloop_firebase_config');
+                if (savedFbConfig) firebaseConfigStr.value = savedFbConfig;
+
+                // Initialize Data Source
+                if (useFirebase.value && firebaseConfigStr.value) {
+                    await initFirebase();
+                } else {
+                    loadLocalTasks();
+                }
+
+                checkAndAutoPush();
+            });
+
+            // --- Firebase Logic ---
+            async function initFirebase() {
+                try {
+                    const config = JSON.parse(firebaseConfigStr.value);
+                    if (!firebase.apps.length) {
+                        firebase.initializeApp(config);
+                    }
+                    db = firebase.firestore();
+                    
+                    // 匿名登录，规避基本的安全规则
+                    await firebase.auth().signInAnonymously();
+                    
+                    firebaseConfigured.value = true;
+                    // 开启实时监听
+                    unsubscribeSnapshot = db.collection('tasks').onSnapshot(snapshot => {
+                        tasks.value = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    }, err => {
+                        console.error("Firebase Auth/Read Error", err);
+                        alert("Firebase 连接失败：请检查 Config 或 Firestore 权限规则 (需允许 read/write)");
+                    });
+
+                } catch (e) {
+                    console.error("Firebase Init Error", e);
+                    alert("Firebase 初始化失败，请检查配置 JSON 格式");
+                    useFirebase.value = false;
+                    loadLocalTasks();
+                }
+            }
+
+            function toggleFirebase() {
+                useFirebase.value = !useFirebase.value;
+            }
+
+            // --- Data Methods ---
+            function loadLocalTasks() {
+                if (unsubscribeSnapshot) unsubscribeSnapshot(); // 停止监听云端
+                const saved = localStorage.getItem('lifeloop_tasks');
+                if (saved) {
+                    tasks.value = JSON.parse(saved);
+                } else {
+                    // Demo Data
+                    tasks.value = [
+                        { id: 'local_1', title: '给鱼缸换水', cycleDays: 7, lastDate: new Date(Date.now() - 8 * 86400000).toISOString().split('T')[0] },
+                        { id: 'local_2', title: '猫咪疫苗', cycleDays: 365, lastDate: '2023-05-20' },
+                    ];
+                }
+            }
+
+            async function saveTask() {
+                if (!form.value.title) return alert('请输入名称');
+                
+                const taskData = { ...form.value };
+                
+                if (useFirebase.value && firebaseConfigured.value) {
+                    // Firebase Save
+                    try {
+                        if (isEditing.value) {
+                            await db.collection('tasks').doc(editingId.value).update(taskData);
+                        } else {
+                            await db.collection('tasks').add(taskData);
+                        }
+                    } catch(e) { alert('云端保存失败: ' + e.message); return; }
+                } else {
+                    // Local Save
+                    if (isEditing.value) {
+                        const idx = tasks.value.findIndex(t => t.id === editingId.value);
+                        if (idx !== -1) tasks.value[idx] = { ...taskData, id: editingId.value };
+                    } else {
+                        tasks.value.push({ ...taskData, id: Date.now().toString() });
+                    }
+                    localStorage.setItem('lifeloop_tasks', JSON.stringify(tasks.value));
+                }
+                closeModal();
+            }
+
+            async function deleteTask() {
+                if(!confirm('确定删除?')) return;
+                
+                if (useFirebase.value && firebaseConfigured.value) {
+                    await db.collection('tasks').doc(editingId.value).delete();
+                } else {
+                    tasks.value = tasks.value.filter(t => t.id !== editingId.value);
+                    localStorage.setItem('lifeloop_tasks', JSON.stringify(tasks.value));
+                }
+                closeModal();
+            }
+
+            async function checkIn(task) {
+                const newDate = new Date().toISOString().split('T')[0];
+                
+                if (useFirebase.value && firebaseConfigured.value) {
+                    await db.collection('tasks').doc(task.id).update({ lastDate: newDate });
+                } else {
+                    const idx = tasks.value.findIndex(t => t.id === task.id);
+                    if (idx !== -1) {
+                        tasks.value[idx].lastDate = newDate;
+                        localStorage.setItem('lifeloop_tasks', JSON.stringify(tasks.value));
+                    }
+                }
+                // 简单的粒子特效或提示可以加在这里
+            }
+
+            async function saveSettings() {
+                // Save Push
+                webhookUrl.value = tempWebhookUrl.value;
+                localStorage.setItem('lifeloop_webhook', webhookUrl.value);
+                localStorage.setItem('lifeloop_autopush', settingsAutoPush.value);
+                
+                // Save Firebase Config
+                localStorage.setItem('lifeloop_use_firebase', useFirebase.value);
+                localStorage.setItem('lifeloop_firebase_config', firebaseConfigStr.value);
+
+                if (useFirebase.value && firebaseConfigStr.value && !firebaseConfigured.value) {
+                    await initFirebase();
+                } else if (!useFirebase.value) {
+                    loadLocalTasks();
+                }
+
+                showSettings.value = false;
+            }
+
+            // --- Helper Logic ---
+            function calculateDaysLeft(task) {
+                const last = new Date(task.lastDate);
+                const next = new Date(last.getTime() + task.cycleDays * 86400000);
+                const today = new Date();
+                today.setHours(0,0,0,0);
+                return Math.ceil((next - today) / 86400000);
+            }
+
+            function getDaysLeftText(task) {
+                const d = calculateDaysLeft(task);
+                if (d < 0) return `超期 ${Math.abs(d)} 天`;
+                if (d === 0) return '今天截止';
+                if (d === 1) return '明天截止';
+                return `${d} 天后`;
+            }
+
+            function getNextDate(task) {
+                const last = new Date(task.lastDate);
+                const next = new Date(last.getTime() + task.cycleDays * 86400000);
+                return next.toISOString().split('T')[0];
+            }
+
+            function getStatusBadge(task) {
+                const d = calculateDaysLeft(task);
+                if (d < 0) return { text: '已过期', class: 'bg-red-500/20 text-red-400' };
+                if (d <= 3) return { text: '紧急', class: 'bg-orange-500/20 text-orange-400' };
+                return { text: '良好', class: 'bg-green-500/20 text-green-400' };
+            }
+
+            function getProgressPercent(task) {
+                const d = calculateDaysLeft(task);
+                if (d < 0) return 100;
+                return Math.max(0, Math.min(100, ((task.cycleDays - d) / task.cycleDays) * 100));
+            }
+            
+            function getProgressColor(task) {
+                const d = calculateDaysLeft(task);
+                if (d < 0) return 'bg-red-500';
+                if (d <= 3) return 'bg-orange-400';
+                return 'bg-blue-500';
+            }
+
+            // --- UI Interaction ---
+            function openAddModal() {
+                isEditing.value = false;
+                form.value = { title: '', cycleDays: 7, lastDate: new Date().toISOString().split('T')[0] };
+                showModal.value = true;
+            }
+            function editTask(task) {
+                isEditing.value = true;
+                editingId.value = task.id;
+                form.value = { ...task };
+                showModal.value = true;
+            }
+            function closeModal() { showModal.value = false; }
+            
+            // --- Push Logic ---
+            async function triggerManualPush() { await sendPush('手动报告'); }
+            
+            async function checkAndAutoPush() {
+                if (!settingsAutoPush.value || !webhookUrl.value) return;
+                const last = localStorage.getItem('lifeloop_last_push_date');
+                const today = new Date().toISOString().split('T')[0];
+                if (last === today) return;
+
+                // Wait a bit for tasks to load if async
+                setTimeout(async () => {
+                    const urgent = tasks.value.filter(t => calculateDaysLeft(t) <= 1);
+                    if (urgent.length > 0) {
+                        if (await sendPush(`有 ${urgent.length} 个事项待处理`)) {
+                            localStorage.setItem('lifeloop_last_push_date', today);
+                        }
+                    }
+                }, 2000);
+            }
+
+            async function sendPush(title) {
+                if (!webhookUrl.value) return false;
+                const urgent = tasks.value.filter(t => calculateDaysLeft(t) <= 3);
+                let content = `### LifeLoop ${title}\n`;
+                if(urgent.length === 0) content += "目前状态良好。";
+                else urgent.forEach(t => content += `- **${t.title}**: ${getDaysLeftText(t)}\n`);
+                
+                try {
+                    let url = webhookUrl.value;
+                    const join = url.includes('?') ? '&' : '?';
+                    await fetch(`${url}${join}title=${encodeURIComponent(title)}&content=${encodeURIComponent(content)}&template=markdown`);
+                    alert('推送成功');
+                    return true;
+                } catch(e) { console.error(e); return false; }
+            }
+
+            return {
+                tasks, todayTasks, otherTasks, urgentCount,
+                showModal, showSettings, settingsTab, isEditing, form,
+                webhookUrl, tempWebhookUrl, settingsAutoPush,
+                useFirebase, firebaseConfigStr, firebaseConfigured, toggleFirebase,
+                openAddModal, editTask, closeModal, saveTask, deleteTask, checkIn, saveSettings, triggerManualPush,
+                calculateDaysLeft, getDaysLeftText, getNextDate, getStatusBadge, getProgressPercent, getProgressColor
+            };
+        }
+    }).mount('#app');
+</script>
+
+</body>
+</html>
